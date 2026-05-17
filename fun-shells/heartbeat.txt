@@ -1,0 +1,23 @@
+# ESP32 CRT 心跳LED模拟
+# 快闪2次+慢闪1次 = 心跳效果
+
+echo "=== 心跳LED启动 ==="
+echo "按任意键停止脚本"
+gpio -s 2 0
+
+# 无限循环
+for  i in 1..10 do
+    # 快速心跳（快闪2次）
+    gpio -s 2 1
+    sleep 100ms
+    gpio -s 2 0
+    sleep 100ms
+    gpio -s 2 1
+    sleep 100ms
+    gpio -s 2 0
+    sleep 300ms
+
+    # 慢跳间隔
+    echo "💓 心跳中..."
+    sleep 500ms
+done

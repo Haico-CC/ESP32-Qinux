@@ -1,0 +1,26 @@
+# ESP32 CRT 跑马灯小程序
+# 控制板载LED(GPIO2)闪烁10次
+
+echo "=== LED跑马灯启动 ==="
+echo "循环次数：10次，间隔0.2秒"
+
+# 设置循环次数
+set count=10
+# 设置GPIO2为输出
+gpio -s 2 0
+
+# 循环10次
+for i in 1..$count do
+    # 点亮LED
+    gpio -s 2 1
+    echo "LED 亮 ✅"
+    sleep 200ms
+    # 熄灭LED
+    gpio -s 2 0
+    echo "LED 灭 ❌"
+    sleep 200ms
+done
+
+echo "=== 跑马灯结束 ==="
+# 复位LED
+gpio -s 2 0
