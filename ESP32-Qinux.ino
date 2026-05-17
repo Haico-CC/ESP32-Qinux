@@ -11,7 +11,7 @@
 #include <utility>
 #include "llm.h"
 
-// LLM Bridge 接口声明
+// SLM Bridge 接口声明
 bool llm_bridge_init(const char*, const char*);
 bool llm_bridge_generate(const char*, int, llm_token_cb, generated_complete_cb, void*);
 bool llm_bridge_is_ready();
@@ -42,11 +42,11 @@ bool isEditing = false;
 String editingFilePath = "";
 int g_lastExitCode = 0;
 
-// ========== LLM 全局状态 ==========
+// ========== SLM 全局状态 ==========
 uint8_t llmActiveClient = 255;
 bool llmGenerationActive = false;
-const char* LLM_MODEL_PATH = "/bin/stories260K.bin";
-const char* LLM_TOKEN_PATH = "/bin/tok512.bin";
+const char* SLM_MODEL_PATH = "/bin/stories260K.bin";
+const char* SLM_TOKEN_PATH = "/bin/tok512.bin";
 
 // ========== 分块传输状态（修复版）==========
 struct ChunkTransferState {
@@ -966,7 +966,7 @@ void checkChunkTimeout() {
   }
 }
 
-// ========== LLM 回调函数 ==========
+// ========== SLM 回调函数 ==========
 void on_llm_token(const char* token, void* user_data) {
   uint8_t* client_id = (uint8_t*)user_data;
   if (*client_id < 255) {
@@ -1582,8 +1582,8 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
 
   // ========== llama 命令处理 ==========
   if (cmd == "llama init" || cmd.startsWith("llama init ")) {
-    String modelPath = LLM_MODEL_PATH;
-    String tokenPath = LLM_TOKEN_PATH;
+    String modelPath = SLM_MODEL_PATH;
+    String tokenPath = SLM_TOKEN_PATH;
     if (cmd.startsWith("llama init ")) {
       String args = cmd.substring(10);
       args.trim();
@@ -1749,12 +1749,12 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
     output += "  wifi scan                 - Scan surrounding networks\n";
     output += "  wifi stats                - Signal quality & rates\n";
     output += "  wifi set power <dBm>      - Adjust TX power (2~20)\n\n";
-    output += "LLM / AI COMMANDS\n-------------------\n";
-    output += "  llama init                - Load the LLM model from /bin/\n";
+    output += "SLM / AI COMMANDS\n-------------------\n";
+    output += "  llama init                - Load the SLM model from /bin/\n";
     output += "  llama init <m.bin> <t.bin> - Load custom model (relative paths)\n";
     output += "  llama \"<prompt>\" [-l N] - Generate (prompt MUST be quoted)\n";
     output += "  llama 'Ask me'            - Single quotes also work\n";
-    output += "  llama status              - Show LLM model status\n";
+    output += "  llama status              - Show SLM model status\n";
     output += "  llama free                - Unload model and free PSRAM\n";
     output += "  * Protected: /bin/ is read-only\n\n";
     output += "HARDWARE CONTROL\n------------------\n";

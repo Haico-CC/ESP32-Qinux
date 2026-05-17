@@ -1,6 +1,6 @@
 # ESP32-Qinux 🐧📟
 
-A lightweight, web-based Linux-inspired terminal shell for ESP32S3 / ESP32, featuring local file management, hardware control, a built-in scripting engine, and **on-device TinySLM inference** running natively on PSRAM.
+A lightweight, web-based Linux-inspired terminal shell for ESP32S3 / ESP32, featuring local file management, hardware control, a built-in scripting engine, and **on-device SLM inference** running natively on PSRAM.
 
 ## ✨ Features
 - 🌐 **Web Terminal**: Responsive CRT-style UI with real-time WebSocket communication.
