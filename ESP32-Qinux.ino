@@ -11,7 +11,7 @@
 #include <utility>
 #include "llm.h"
 
-// SLM Bridge 接口声明
+// LLM Bridge 接口声明
 bool llm_bridge_init(const char*, const char*);
 bool llm_bridge_generate(const char*, int, llm_token_cb, generated_complete_cb, void*);
 bool llm_bridge_is_ready();
@@ -42,13 +42,13 @@ bool isEditing = false;
 String editingFilePath = "";
 int g_lastExitCode = 0;
 
-// ========== SLM 全局状态 ==========
+// ========== LLM 全局状态 ==========
 uint8_t llmActiveClient = 255;
 bool llmGenerationActive = false;
-const char* SLM_MODEL_PATH = "/bin/stories260K.bin";
-const char* SLM_TOKEN_PATH = "/bin/tok512.bin";
+const char* LLM_MODEL_PATH = "/bin/stories260K.bin";
+const char* LLM_TOKEN_PATH = "/bin/tok512.bin";
 
-// ========== 分块传输状态（修复版）==========
+// ========== 分块传输状态 ==========
 struct ChunkTransferState {
   bool active = false;
   bool isUpload = false;
@@ -68,6 +68,9 @@ ChunkTransferState chunkState;
 // ========== 受保护目录列表 ==========
 const char* PROTECTED_DIRS[] = { "/bin", "/etc", "/sys" };
 const int PROTECTED_COUNT = sizeof(PROTECTED_DIRS) / sizeof(PROTECTED_DIRS[0]);
+
+// ========== Web 编辑器映射 ==========
+std::map<uint8_t, String> clientEditFiles;
 
 bool isProtectedPath(const String& path) {
   String resolved = resolvePath(path);
@@ -215,6 +218,12 @@ String escapeJson(String str) {
     else if (c == '\n') result += "\\n";
     else if (c == '\r') result += "\\r";
     else if (c == '\t') result += "\\t";
+    else if ((unsigned char)c < 0x20) {
+      // 转义其他控制字符（0x00-0x1F），防止 JSON 非法
+      char buf[8];
+      snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+      result += buf;
+    }
     else result += c;
   }
   return result;
@@ -342,20 +351,15 @@ String getAuthModeStr(wifi_auth_mode_t auth) {
   }
 }
 
-// ========= ✨ WiFi功率转换辅助函数（Core 3.x修复）✨ ==========
+// ========= WiFi功率转换辅助函数（Core 3.x修复）=========
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-// dBm → wifi_power_t 枚举值（支持0.5dBm步进，公式：枚举值 = dBm × 4）
 wifi_power_t dbmToWifiPower(int dbm) {
   int enum_val = (int)((float)dbm * 4.0f + 0.5f);
   return static_cast<wifi_power_t>(constrain(enum_val, -4, 84));
 }
-
-// wifi_power_t 枚举值 → dBm（浮点精度）
 float wifiPowerToDbm(wifi_power_t power) {
   return (float)power / 4.0f;
 }
-
-// 获取当前发射功率的dBm值（整数显示用，四舍五入）
 int getWiFiTxPowerDbm() {
   wifi_power_t power = WiFi.getTxPower();
   return (int)(wifiPowerToDbm(power) + 0.5f);
@@ -366,8 +370,7 @@ bool setWiFiTxPower(int dbm) {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   dbm = constrain(dbm, -1, 21);
   wifi_power_t power_enum = dbmToWifiPower(dbm);
-  bool result = WiFi.setTxPower(power_enum);
-  return result;
+  return WiFi.setTxPower(power_enum);
 #else
   dbm = constrain(dbm, -20, 20);
   return WiFi.setTxPower(dbm);
@@ -392,7 +395,6 @@ void handleWifiCommand(String args, String& output) {
       } else output += "wifi: STA:        Disconnected\n";
     }
     output += "wifi: Channel:   " + String(WiFi.channel()) + "\n";
-    // ✨ 修复：Core 3.x 正确显示dBm值
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
     output += "wifi: Tx Power:  " + String(getWiFiTxPowerDbm()) + " dBm\n";
 #else
@@ -418,7 +420,6 @@ void handleWifiCommand(String args, String& output) {
 #endif
     output += "MAC Address:     " + WiFi.macAddress() + "\n";
     output += "Channel:         " + String(WiFi.channel()) + "\n";
-    // ✨ 修复：Core 3.x 正确显示dBm值
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
     output += "Tx Power:        " + String(getWiFiTxPowerDbm()) + " dBm\n";
 #else
@@ -500,8 +501,6 @@ void handleWifiCommand(String args, String& output) {
       output = "wifi: Usage: wifi set power <dBm>\n";
       output += "wifi: Range: 2 (min) ~ 20 (max) dBm [Core 3.x]\n";
       output += "wifi: Step: 0.5 dBm granularity\n";
-
-      // ✨ 修复：正确显示当前功率
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
       output += "wifi: Current: " + String(getWiFiTxPowerDbm()) + " dBm\n";
 #else
@@ -527,7 +526,6 @@ void handleWifiCommand(String args, String& output) {
 
     if (setWiFiTxPower(power)) {
       output = "wifi: Tx power set to " + String(power) + " dBm\n";
-
       wifi_mode_t mode = WiFi.getMode();
       if (mode & WIFI_STA) {
         output += "wifi: Note: In 802.11n mode, max ~15dBm may apply\n";
@@ -713,14 +711,29 @@ bool evaluateCondition(String condition) {
 }
 
 int findBlockEndEx(const std::vector<String>& lines, int startLine, const char* endKeyword) {
-  int depth = 1;
+  // 使用栈追踪块类型，确保 if→fi、for/while→done 严格配对
+  std::vector<String> stack;
+  stack.push_back(endKeyword);
   for (int i = startLine; i < (int)lines.size(); i++) {
     String line = lines[i];
     line.trim();
-    if (line.startsWith("if ") || line.startsWith("for ") || line.startsWith("while ")) depth++;
-    else if (line == "fi" || line == "done") {
-      depth--;
-      if (depth == 0 && line == endKeyword) return i;
+    // 块起始关键字 → 压入期望的结束关键字
+    if (line.startsWith("if ")) {
+      stack.push_back("fi");
+    } else if (line.startsWith("elif ")) {
+      // elif 与 if 同级，不增加嵌套；但必须处于 if 块内
+      if (stack.empty() || stack.back() != "fi") return -1;
+    } else if (line.startsWith("for ") || line.startsWith("while ")) {
+      stack.push_back("done");
+    } else if (line == "else") {
+      // else 不改变期望的结束关键字，但必须处于 if/elif 块内
+      if (stack.empty() || stack.back() != "fi") return -1;
+    } else if (line == "fi" || line == "done") {
+      if (stack.empty()) return -1;
+      String expected = stack.back();
+      stack.pop_back();
+      if (line != expected) return -1;  // 类型不匹配，例如 done 关闭 if
+      if (stack.empty()) return i;      // 找到匹配的结束关键字
     }
   }
   return -1;
@@ -763,7 +776,7 @@ bool scriptReadInput(String& varName, String& output) {
 void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTerminal, String& dlFileName, String& dlContent, bool& triggerUpload);
 void executeScriptBlockEx(const std::vector<String>& lines, int startLine, int endLine, String& output, bool* outBreak = nullptr, bool* outContinue = nullptr);
 
-// ========== 分块传输函数（修复版）==========
+// ========== 分块传输函数 ==========
 bool startChunkedDownload(const String& filePath, uint8_t clientNum) {
   if (!LittleFS.exists(filePath)) return false;
   File f = LittleFS.open(filePath, "r");
@@ -966,7 +979,7 @@ void checkChunkTimeout() {
   }
 }
 
-// ========== SLM 回调函数 ==========
+// ========== LLM 回调函数 ==========
 void on_llm_token(const char* token, void* user_data) {
   uint8_t* client_id = (uint8_t*)user_data;
   if (*client_id < 255) {
@@ -1051,32 +1064,53 @@ bool executeScriptLine(const String& line, const std::vector<String>& lines, int
     return true;
   }
   if (processed.startsWith("if ")) {
-    String condition = processed.substring(3);
-    int thenPos = condition.indexOf(" then");
-    if (thenPos != -1) condition = condition.substring(0, thenPos);
-    condition.trim();
-    condition = substituteVariables(condition);
-    bool condResult = evaluateCondition(condition);
+    // —— 收集 if / elif / else 分支 ————
     int fiLine = findBlockEndEx(lines, lineIdx + 1, "fi");
     if (fiLine == -1) {
       output += "  > script: Error: missing 'fi'\n";
       return false;
     }
-    int elseLine = -1;
+
+    struct Branch { int line; String cond; };
+    std::vector<Branch> branches;
+
+    // 第一条分支: if
+    String cond0 = processed.substring(3);
+    int thenPos0 = cond0.indexOf(" then");
+    if (thenPos0 != -1) cond0 = cond0.substring(0, thenPos0);
+    cond0.trim();
+    branches.push_back({lineIdx, substituteVariables(cond0)});
+
+    // 扫描 elif / else
     for (int j = lineIdx + 1; j < fiLine; j++) {
       String temp = lines[j];
       temp.trim();
-      if (temp == "else") {
-        elseLine = j;
+      if (temp.startsWith("elif ")) {
+        String elifCond = temp.substring(5);
+        int tp = elifCond.indexOf(" then");
+        if (tp != -1) elifCond = elifCond.substring(0, tp);
+        elifCond.trim();
+        branches.push_back({j, substituteVariables(elifCond)});
+      } else if (temp == "else") {
+        branches.push_back({j, "1"});  // else 条件恒真
+      }
+    }
+
+    // 执行第一个满足条件的分支
+    for (int b = 0; b < (int)branches.size(); b++) {
+      if (evaluateCondition(branches[b].cond)) {
+        int blockStart = branches[b].line + 1;
+        int blockEnd   = (b + 1 < (int)branches.size()) ? branches[b + 1].line : fiLine;
+        executeScriptBlockEx(lines, blockStart, blockEnd, output);
         break;
       }
     }
-    if (condResult) executeScriptBlockEx(lines, lineIdx + 1, (elseLine != -1 ? elseLine : fiLine), output);
-    else if (elseLine != -1) executeScriptBlockEx(lines, elseLine + 1, fiLine, output);
+
     lineIdx = fiLine;
     return true;
   }
-  if (trimmed.startsWith("while ")) {
+  if (processed.startsWith("while ")) {
+    // 条件从 trimmed (未替换) 提取，保留 $var 引用以供每轮迭代重新求值
     String condition = trimmed.substring(6);
     int doPos = condition.indexOf(" do");
     if (doPos != -1) condition = condition.substring(0, doPos);
@@ -1122,13 +1156,25 @@ bool executeScriptLine(const String& line, const std::vector<String>& lines, int
       output += "  > script: Error: missing 'done'\n";
       return false;
     }
-    for (int j = start; j <= end; j++) {
-      scriptVars[varName] = String(j);
-      bool loopBreak = false, loopContinue = false;
-      executeScriptBlockEx(lines, lineIdx + 1, doneLine, output, &loopBreak, &loopContinue);
-      if (loopBreak) break;
-      if (loopContinue) continue;
-      yield();
+    // 支持递增和递减范围
+    if (start <= end) {
+      for (int j = start; j <= end; j++) {
+        scriptVars[varName] = String(j);
+        bool loopBreak = false, loopContinue = false;
+        executeScriptBlockEx(lines, lineIdx + 1, doneLine, output, &loopBreak, &loopContinue);
+        if (loopBreak) break;
+        if (loopContinue) continue;
+        yield();
+      }
+    } else {
+      for (int j = start; j >= end; j--) {
+        scriptVars[varName] = String(j);
+        bool loopBreak = false, loopContinue = false;
+        executeScriptBlockEx(lines, lineIdx + 1, doneLine, output, &loopBreak, &loopContinue);
+        if (loopBreak) break;
+        if (loopContinue) continue;
+        yield();
+      }
     }
     lineIdx = doneLine;
     return true;
@@ -1172,7 +1218,7 @@ void executeScriptBlockEx(const std::vector<String>& lines, int startLine, int e
   }
 }
 
-// ========== HTML前端内容 ==========
+// ========== HTML前端内容（含Web编辑器）==========
 const char HTML_CONTENT[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -1208,6 +1254,17 @@ const char HTML_CONTENT[] PROGMEM = R"rawliteral(
         @keyframes glow { from { text-shadow: 0 0 3px #00ff88; } to { text-shadow: 0 0 15px #00ff88, 0 0 30px #00aa55; } }
         .exit-hint { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); color: #0f0; background: rgba(0, 20, 0, 0.85); padding: 8px 16px; border-radius: 4px; z-index: 200; font-size: clamp(10px, 2vw, 14px); border: 1px solid #005500; animation: hintFade 3s forwards; }
         @keyframes hintFade { 0%, 80% { opacity: 1; } 100% { opacity: 0; } }
+        /* 编辑器样式 */
+        #editorContainer { display: none; flex: 1; flex-direction: column; z-index: 3; position: relative; }
+        #editorToolbar { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; }
+        #editorFilename { color: #0f0; }
+        #editorTextarea { flex: 1; width: 100%; background: #000; color: #0f0; border: 1px solid #0f0; font-family: 'Courier New', monospace; font-size: inherit; line-height: 1.2; text-shadow: 0 0 3px #00ff00; resize: none; padding: 5px; box-sizing: border-box; }
+        #editorSaveBtn { background: #0a0; color: #000; border: none; padding: 2px 8px; cursor: pointer; }
+        #editorCancelBtn { background: #a00; color: #fff; border: none; padding: 2px 8px; cursor: pointer; }
+        #editorSaveBtn:hover { background: #0f0; }
+        #editorCancelBtn:hover { background: #f00; }
+        #editorCursorPos { color: #0a0; margin-right: 10px; font-size: 0.85em; }
+        #editorHints { color: #080; margin-right: 10px; font-size: 0.8em; }
     </style>
 </head>
 <body>
@@ -1221,6 +1278,18 @@ const char HTML_CONTENT[] PROGMEM = R"rawliteral(
             <div class="input-line">
                 <span class="prompt" id="prompt">root@esp32:/# </span>
                 <input type="text" id="input" autocomplete="off" autofocus>
+            </div>
+            <div id="editorContainer">
+                <div id="editorToolbar">
+                    <span id="editorFilename"></span>
+                    <div>
+                        <span id="editorHints">Ctrl+S Save · Esc Cancel</span>
+                        <span id="editorCursorPos">Ln 1, Col 1</span>
+                        <button id="editorSaveBtn">Save</button>
+                        <button id="editorCancelBtn">Cancel</button>
+                    </div>
+                </div>
+                <textarea id="editorTextarea"></textarea>
             </div>
         </div>
     </div>
@@ -1239,9 +1308,91 @@ const char HTML_CONTENT[] PROGMEM = R"rawliteral(
         const CAT_EMOJIS = ['🐱', '😺', '😸', '😻', '😽', '🙀', '😿', '😾', '🐈', '🐈‍⬛', '🐾'];
         const cmdHistory = [];
         let histPos = -1;
-        let isEditingMode = false;
+        let isEditingMode = false;       // 终端逐行编辑模式（EOF退出）
+        let isEditorMode = false;        // Web 全屏编辑器模式
+        let currentEditFilename = '';
         let lastDlProg = -1;
         let lastUlProg = -1;
+
+        // 编辑器相关 DOM
+        const editorContainer = document.getElementById('editorContainer');
+        const editorTextarea = document.getElementById('editorTextarea');
+        const editorFilename = document.getElementById('editorFilename');
+        const editorSaveBtn = document.getElementById('editorSaveBtn');
+        const editorCancelBtn = document.getElementById('editorCancelBtn');
+        const editorCursorPos = document.getElementById('editorCursorPos');
+
+        function enterEditorMode(filename, content) {
+            document.querySelector('.input-line').style.display = 'none';
+            editorContainer.style.display = 'flex';
+            editorFilename.textContent = filename;
+            editorTextarea.value = content;
+            currentEditFilename = filename;
+            isEditorMode = true;
+            editorTextarea.focus();
+        }
+
+        function exitEditorMode() {
+            document.querySelector('.input-line').style.display = 'flex';
+            editorContainer.style.display = 'none';
+            isEditorMode = false;
+            currentEditFilename = '';
+            input.focus();
+        }
+
+        editorSaveBtn.addEventListener('click', () => {
+            if (!isEditorMode) return;
+            const content = editorTextarea.value;
+            // 使用 TextEncoder 将 JS 字符串正确编码为 UTF-8 字节
+            const encoder = new TextEncoder();
+            const utf8Bytes = encoder.encode(content);
+            let binary = '';
+            for (let i = 0; i < utf8Bytes.length; i++) {
+                binary += String.fromCharCode(utf8Bytes[i]);
+            }
+            const b64 = btoa(binary);
+            ws.send('__EDIT_SAVE__:' + currentEditFilename + ':' + b64);
+            exitEditorMode();
+        });
+
+        editorCancelBtn.addEventListener('click', () => {
+            exitEditorMode();
+        });
+
+        editorTextarea.addEventListener('keydown', (e) => {
+            // Ctrl+S / Cmd+S → 保存
+            if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+                e.preventDefault();
+                editorSaveBtn.click();
+                return;
+            }
+            // Escape → 取消
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                editorCancelBtn.click();
+                return;
+            }
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                const start = editorTextarea.selectionStart;
+                const end = editorTextarea.selectionEnd;
+                editorTextarea.value = editorTextarea.value.substring(0, start) + '\t' + editorTextarea.value.substring(end);
+                editorTextarea.selectionStart = editorTextarea.selectionEnd = start + 1;
+            }
+        });
+
+        function updateCursorPos() {
+            const text = editorTextarea.value;
+            const pos = editorTextarea.selectionStart;
+            let line = 1, col = 1;
+            for (let i = 0; i < pos; i++) {
+                if (text[i] === '\n') { line++; col = 1; }
+                else col++;
+            }
+            editorCursorPos.textContent = 'Ln ' + line + ', Col ' + col;
+        }
+        editorTextarea.addEventListener('keyup', updateCursorPos);
+        editorTextarea.addEventListener('click', updateCursorPos);
 
         function showExitHint(text) {
             const existing = document.querySelector('.exit-hint');
@@ -1437,6 +1588,10 @@ const char HTML_CONTENT[] PROGMEM = R"rawliteral(
             ws.onmessage = (evt) => {
                 try {
                     const data = JSON.parse(evt.data);
+                    if (data.edit_start) {
+                        enterEditorMode(data.edit_start.filename, data.edit_start.content);
+                        return;
+                    }
                     if (data.dl_start) { handleDownloadStart(data.dl_start); return; }
                     if (data.dl_chunk) { handleDownloadChunk(data.dl_chunk); return; }
                     if (data.dl_end) { handleDownloadEnd(data.dl_end); return; }
@@ -1488,6 +1643,7 @@ const char HTML_CONTENT[] PROGMEM = R"rawliteral(
         });
         function syncTime() { ws.send(`__SYNC_TIME__:${Math.floor(Date.now() / 1000)}`); }
         input.addEventListener('keydown', (e) => {
+            if (isEditorMode) return;
             if (e.key === 'Enter') {
                 const cmd = input.value;
                 if(isEditingMode) output.textContent += cmd + '\n';
@@ -1544,6 +1700,7 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
   triggerUpload = false;
   g_lastExitCode = 0;
 
+  // 串口逐行编辑模式（Web端不会进入此分支）
   if (isEditing) {
     newPrompt = "";
     if (cmd == "EOF") {
@@ -1582,8 +1739,8 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
 
   // ========== llama 命令处理 ==========
   if (cmd == "llama init" || cmd.startsWith("llama init ")) {
-    String modelPath = SLM_MODEL_PATH;
-    String tokenPath = SLM_TOKEN_PATH;
+    String modelPath = LLM_MODEL_PATH;
+    String tokenPath = LLM_TOKEN_PATH;
     if (cmd.startsWith("llama init ")) {
       String args = cmd.substring(10);
       args.trim();
@@ -1726,8 +1883,8 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
     output += "  * read <var>              - Read input line and store into variable $var\n";
     output += "  * set var=value           - Define a custom shell variable\n";
     output += "  * set var=expr            - Calculate arithmetic expression (+-*/%) and assign\n";
-    output += "  * if cond then ... fi     - Basic conditional execution block\n";
-    output += "  * if cond then ... else ... fi - Conditional execution with else branch\n";
+    output += "  * if cond then ... fi     - Conditional execution block\n";
+    output += "  * if ... elif ... else ... fi - Multi-branch conditional\n";
     output += "  * for i in 1..5 do ... done - Numeric loop (iterate from 1 to 5)\n";
     output += "  * while cond do ... done  - Loop while the condition is true\n";
     output += "  * break                   - Exit the current loop immediately\n";
@@ -1749,12 +1906,12 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
     output += "  wifi scan                 - Scan surrounding networks\n";
     output += "  wifi stats                - Signal quality & rates\n";
     output += "  wifi set power <dBm>      - Adjust TX power (2~20)\n\n";
-    output += "SLM / AI COMMANDS\n-------------------\n";
-    output += "  llama init                - Load the SLM model from /bin/\n";
+    output += "LLM / AI COMMANDS\n-------------------\n";
+    output += "  llama init                - Load the LLM model from /bin/\n";
     output += "  llama init <m.bin> <t.bin> - Load custom model (relative paths)\n";
     output += "  llama \"<prompt>\" [-l N] - Generate (prompt MUST be quoted)\n";
     output += "  llama 'Ask me'            - Single quotes also work\n";
-    output += "  llama status              - Show SLM model status\n";
+    output += "  llama status              - Show LLM model status\n";
     output += "  llama free                - Unload model and free PSRAM\n";
     output += "  * Protected: /bin/ is read-only\n\n";
     output += "HARDWARE CONTROL\n------------------\n";
@@ -1959,6 +2116,7 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
   }
 
   if (cmd == "edit" || cmd.startsWith("edit ")) {
+    // 此分支仅用于串口模式，Web端已被拦截
     String pathArg = (cmd == "edit") ? "" : cmd.substring(5);
     pathArg.trim();
     if (pathArg.isEmpty()) {
@@ -2512,6 +2670,93 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
     return;
   }
 
+  // ===== Web 编辑器保存 =====
+  if (msg.startsWith("__EDIT_SAVE__:")) {
+    String payload = msg.substring(14);
+    int sep = payload.indexOf(':');
+    String filename;
+    String b64Content;
+    if (sep != -1) {
+      filename = payload.substring(0, sep);
+      b64Content = payload.substring(sep + 1);
+    } else {
+      if (clientEditFiles.count(num)) {
+        filename = clientEditFiles[num];
+        b64Content = payload;
+      } else {
+        webSocket.sendTXT(num, "{\"output\":\"edit: Save failed: no active file\\n\"}");
+        return;
+      }
+    }
+
+    String fullPath = resolvePath(filename);
+    if (!canWritePath(fullPath)) {
+      webSocket.sendTXT(num, "{\"output\":\"edit: Permission denied\\n\"}");
+      return;
+    }
+
+    std::vector<uint8_t> data = base64Decode(b64Content);
+    File f = LittleFS.open(fullPath, "w");
+    if (!f || f.isDirectory()) {
+      if (f) f.close();
+      webSocket.sendTXT(num, "{\"output\":\"edit: Cannot write file\\n\"}");
+      return;
+    }
+    size_t written = f.write(data.data(), data.size());
+    f.close();
+
+    clientEditFiles.erase(num);
+
+    String resp = "{\"output\":\"edit: File saved: " + escapeJson(filename) +
+                  " (" + String(written) + " bytes)\\n\"}";
+    webSocket.sendTXT(num, resp);
+    return;
+  }
+
+  // ===== Web 编辑器启动 =====
+  if (msg == "edit" || msg.startsWith("edit ")) {
+    String pathArg = (msg == "edit") ? "" : msg.substring(5);
+    pathArg.trim();
+    if (pathArg.isEmpty()) {
+      String resp = "{\"output\":\"edit: Usage: edit <file>\\n\"}";
+      webSocket.sendTXT(num, resp);
+      return;
+    }
+
+    String fullPath = resolvePath(pathArg);
+    if (isProtectedPath(fullPath)) {
+      String resp = "{\"output\":\"edit: Permission denied: protected file\\n\"}";
+      webSocket.sendTXT(num, resp);
+      return;
+    }
+
+    String fileContent = "";
+    if (LittleFS.exists(fullPath)) {
+      File f = LittleFS.open(fullPath, "r");
+      if (f && !f.isDirectory()) {
+        size_t fSize = f.size();
+        // 限制编辑器最大打开文件大小为 128KB，防止 readString() OOM 崩溃
+        if (fSize > 128 * 1024) {
+          f.close();
+          String resp = "{\"output\":\"edit: File too large for editor (max 128KB, use dl to download)\\n\"}";
+          webSocket.sendTXT(num, resp);
+          return;
+        }
+        fileContent = f.readString();
+        f.close();
+      } else if (f) f.close();
+    }
+
+    clientEditFiles[num] = fullPath;
+
+    String json = "{\"edit_start\":{";
+    json += "\"filename\":\"" + escapeJson(pathArg) + "\",";
+    json += "\"content\":\"" + escapeJson(fileContent) + "\"";
+    json += "}}";
+    webSocket.sendTXT(num, json);
+    return;
+  }
+
   if (llmGenerationActive && !msg.startsWith("llama status")) {
     String resp = "{\"output\":\"llama: Busy generating.\\n\",";
     resp += "\"prompt\":\"root@esp32:" + currentPath + "# \"}";
@@ -2654,7 +2899,7 @@ void loop() {
   webServer.handleClient();
   webSocket.loop();
   processSerialInput();
-  checkChunkTimeout();
+  checkChunkTimeout(); 
 
   if (chunkState.active && !chunkState.isUpload && !chunkState.sending) {
     sendNextChunk();
