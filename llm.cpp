@@ -263,7 +263,7 @@ void free_tokenizer(Tokenizer *t) {
   free(t->vocab); free(t->vocab_scores); free(t->sorted_vocab);
 }
 
-char *decode(Tokenizer *t, int prev_token, int token) {
+const char *decode(Tokenizer *t, int prev_token, int token) {
   if (token < 0 || token >= t->vocab_size || !t->vocab[token]) return "<unk>";
   char *piece = t->vocab[token];
   if (prev_token == 1 && piece[0] == ' ') piece++;
@@ -405,7 +405,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     pos++;
     if (next == 1 || next == 2) break;
 
-    char *piece = decode(tokenizer, token, next);
+    const char *piece = decode(tokenizer, token, next);
     if (on_token) on_token(piece, user_data);
     token = next;
     if (start == 0) start = time_in_ms();
