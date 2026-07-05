@@ -122,6 +122,8 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
   String output, newPrompt, dlFileName, dlContent;
   bool clearTerminal, triggerUpload;
 
+  // ===== 打开网页文件（www 由 commands.h 处理，此处仅负责 JSON 转换）=====
+
   if (msg.startsWith("__UPLOAD__:")) {
     const int PREFIX_LEN = 11;
     int firstSep = msg.indexOf(':', PREFIX_LEN);
@@ -152,7 +154,13 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
   executeCommand(msg, output, newPrompt, clearTerminal, dlFileName, dlContent, triggerUpload);
   wifiCmdClientNum = 255;
   String resp = "{\"prompt\":\"" + escapeJson(newPrompt) + "\",";
-  if (!output.isEmpty()) resp += "\"output\":\"" + escapeJson(output) + "\",";
+  if (!output.isEmpty()) {
+    if (output.startsWith("__WWW__:")) {
+      resp += "\"www\":\"" + escapeJson(output.substring(8)) + "\",";
+    } else {
+      resp += "\"output\":\"" + escapeJson(output) + "\",";
+    }
+  }
   resp += "\"clear\":" + String(clearTerminal ? "true" : "false");
   if (!dlFileName.isEmpty()) resp += ",\"download\":{\"filename\":\"" + escapeJson(dlFileName) + "\",\"content\":\"" + escapeJson(dlContent) + "\"}";
   if (triggerUpload) resp += ",\"upload\":true";
@@ -188,6 +196,35 @@ void processSerialInput() {
 
 // ========== Web 服务器处理 ==========
 void handleRoot() { webServer.send_P(200, "text/html", HTML_CONTENT); }
-void handleNotFound() { webServer.sendHeader("Location", "http://" + AP_IP.toString() + "/"); webServer.send(302, "text/plain", "Redirecting..."); }
+void handleWww();
+
+void handleNotFound() {
+  String uri = webServer.uri();
+  if (uri.startsWith("/www/")) {
+    handleWww();
+  } else {
+    webServer.sendHeader("Location", "http://" + AP_IP.toString() + "/");
+    webServer.send(302, "text/plain", "Redirecting...");
+  }
+}
+
+void handleWww() {
+  String path = webServer.uri();
+  path = path.substring(4); // 去掉 "/www"，保留后续的 "/xxx"
+  if (path.isEmpty() || path == "/") { webServer.send(200, "text/plain", "www: Usage: /www/<file>"); return; }
+  if (!LittleFS.exists(path)) { webServer.send(404, "text/plain", "www: File not found: " + path); return; }
+  File f = LittleFS.open(path, "r");
+  if (!f || f.isDirectory()) { if (f) f.close(); webServer.send(404, "text/plain", "www: Not a file"); return; }
+  String mime = "text/html";
+  if (path.endsWith(".css")) mime = "text/css";
+  else if (path.endsWith(".js")) mime = "application/javascript";
+  else if (path.endsWith(".json")) mime = "application/json";
+  else if (path.endsWith(".png")) mime = "image/png";
+  else if (path.endsWith(".jpg") || path.endsWith(".jpeg")) mime = "image/jpeg";
+  else if (path.endsWith(".svg")) mime = "image/svg+xml";
+  else if (path.endsWith(".txt")) mime = "text/plain";
+  String content = f.readString(); f.close();
+  webServer.send(200, mime, content);
+}
 
 #endif

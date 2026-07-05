@@ -391,6 +391,7 @@ const char HTML_CONTENT[] PROGMEM = R"rawliteral(
                             URL.revokeObjectURL(url);
                         } catch(e) { output.textContent += "[ERR] Download failed: " + e.message + "\n"; output.scrollTop = output.scrollHeight; }
                     }
+                    if (data.www) { window.open(data.www, '_blank'); }
                     if (data.upload) fileInput.click();
                 } catch (e) { output.textContent += "[ERR] Message parse failed\n"; output.scrollTop = output.scrollHeight; }
             };

@@ -15,6 +15,13 @@ extern int g_lastExitCode;
 extern uint8_t llmActiveClient;
 extern bool llmGenerationActive;
 extern WebSocketsServer webSocket;
+extern WiFiUDP udp;
+extern std::vector<MsgDevice> msgDevices;
+extern const uint16_t MSG_PORT;
+extern WiFiUDP udp;
+extern bool staConnected;
+extern unsigned long staConnectStart;
+String getDeviceName();
 
 // ========== Fortune 彩蛋库 ==========
 static const char* FORTUNES[] PROGMEM = {
@@ -161,8 +168,15 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
       output += "  cp <src> <dst>   Copy source file to destination\n"; return;
     }
     if (topic == "mv") {
-      output += "mv — Move / rename files and directories\n";
-      output += "  mv <src> <dst>   Move or rename source to destination\n"; return;
+      output += "mv — Move files/directories to a new location\n";
+      output += "  mv <src> <dir>     Move into directory\n";
+      output += "  mv <src> <newpath> Move to new path\n";
+      output += "  Use 'rename' to rename without moving.\n"; return;
+    }
+    if (topic == "rename") {
+      output += "rename — Rename a file or directory in place\n";
+      output += "  rename <old> <new> Rename in same directory\n";
+      output += "  New name cannot contain '/'.\n"; return;
     }
     if (topic == "echo") {
       output += "echo — Print text or write to file\n";
@@ -309,6 +323,19 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
       output += "matrix — Digital rain easter egg 🌧️\n";
       output += "  Press any key to exit.\n"; return;
     }
+    if (topic == "msg" || topic == "message") {
+      output += "msg — LAN messaging (requires WiFi STA)\n";
+      output += "  msg list              Show discovered peers\n";
+      output += "  msg scan              Scan LAN for ESP32-Qinux\n";
+      output += "  msg name <name>       Set your device name\n";
+      output += "  msg send <#> <text>   Send message to peer\n";
+      output += "  Incoming messages appear in real-time.\n"; return;
+    }
+    if (topic == "www") {
+      output += "www — Open HTML file in browser\n";
+      output += "  www <file>            Serve file from LittleFS\n";
+      output += "  Opens in new tab. Supports .html .css .js\n"; return;
+    }
     if (topic == "fortune") {
       output += "fortune — Ask the silicon oracle 🎱\n"; return;
     }
@@ -410,6 +437,7 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
     if (!d || !d.isDirectory()) { if (d) d.close(); output = "cd: " + target + ": Not a directory\n"; return; }
     d.close();
     currentPath = newPath;
+    newPrompt = "root@esp32:" + currentPath + "# ";
     return;
   }
 
@@ -526,18 +554,48 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
     if (isProtectedPath(srcPath)) { output = "mv: Permission denied\n"; return; }
     File srcFile = LittleFS.open(srcPath, "r");
     if (!srcFile) { output = "mv: Cannot open source\n"; return; }
-    if (srcFile.isDirectory()) {
-      srcFile.close();
-      if (LittleFS.rename(srcPath, dstPath)) output = "mv: Moved " + src + " -> " + dst + "\n";
+    bool srcIsDir = srcFile.isDirectory();
+    srcFile.close();
+    // 如果目标是已存在的目录，移入其中保留原名
+    File dstCheck = LittleFS.open(dstPath, "r");
+    if (dstCheck && dstCheck.isDirectory()) {
+      dstCheck.close();
+      String srcName = srcPath.substring(srcPath.lastIndexOf('/') + 1);
+      dstPath = dstPath + (dstPath.endsWith("/") ? "" : "/") + srcName;
+    } else if (dstCheck) dstCheck.close();
+
+    if (srcIsDir) {
+      if (LittleFS.rename(srcPath, dstPath)) output = "mv: Moved " + src + " -> " + dstPath + "\n";
       else output = "mv: Failed\n";
       return;
     }
+    // 普通文件：复制到目标，删除源文件
     File dstFile = LittleFS.open(dstPath, "w");
-    if (!dstFile) { output = "mv: Cannot write to " + dst + "\n"; srcFile.close(); return; }
-    while (srcFile.available()) dstFile.write(srcFile.read());
-    srcFile.close(); dstFile.close();
+    if (!dstFile) { output = "mv: Cannot write to " + dstPath + "\n"; return; }
+    File srcF = LittleFS.open(srcPath, "r");
+    while (srcF.available()) dstFile.write(srcF.read());
+    srcF.close(); dstFile.close();
     LittleFS.remove(srcPath);
-    output = "mv: Moved " + src + " -> " + dst + "\n";
+    output = "mv: Moved " + src + " -> " + dstPath + "\n";
+    return;
+  }
+  if (cmd == "rename" || cmd.startsWith("rename ")) {
+    String args = (cmd == "rename") ? "" : cmd.substring(7); args.trim();
+    // rename 仅接受空格分隔的两个参数
+    int spacePos = args.indexOf(' ');
+    if (spacePos == -1) { output = "rename: Usage: rename <old> <new>\n"; return; }
+    String oldName = args.substring(0, spacePos), newName = args.substring(spacePos + 1);
+    oldName.trim(); newName.trim();
+    if (oldName.isEmpty() || newName.isEmpty()) { output = "rename: Usage: rename <old> <new>\n"; return; }
+    if (newName.indexOf('/') != -1) { output = "rename: New name must be a filename, not a path. Use 'mv' to move.\n"; return; }
+    String srcPath = resolvePath(oldName);
+    if (!LittleFS.exists(srcPath)) { output = "rename: " + oldName + ": No such file\n"; return; }
+    if (isProtectedPath(srcPath)) { output = "rename: Protected path\n"; return; }
+    String parent = srcPath.substring(0, srcPath.lastIndexOf('/') + 1);
+    String dstPath = parent + newName;
+    if (LittleFS.exists(dstPath)) { output = "rename: '" + newName + "' already exists\n"; return; }
+    if (LittleFS.rename(srcPath, dstPath)) output = "rename: " + oldName + " -> " + newName + "\n";
+    else output = "rename: Failed\n";
     return;
   }
 
@@ -644,6 +702,96 @@ void executeCommand(String cmd, String& output, String& newPrompt, bool& clearTe
 
   if (cmd == "fortune") { output = FORTUNES[random(FORTUNE_COUNT)] + String("\n"); return; }
   if (cmd == "matrix") { output = "__MATRIX_MODE__"; return; }
+
+  // ========== 局域网消息 ==========
+  if (cmd == "msg" || cmd == "message" || cmd.startsWith("msg ") || cmd.startsWith("message ")) {
+    String prefix = (cmd == "msg" || cmd.startsWith("msg ")) ? "msg" : "message";
+    String args = (cmd == prefix) ? "" : cmd.substring(prefix.length() + 1); args.trim();
+    if (!staConnected && WiFi.status() != WL_CONNECTED) { output = "msg: WiFi not connected\n"; return; }
+
+    extern std::vector<MsgDevice> msgDevices;
+    extern const uint16_t MSG_PORT;
+
+    // msg / msg list / msg scan — 扫描并列表
+    if (args.isEmpty() || args == "list" || args == "scan") {
+      if (wifiCmdClientNum != 255 && wifiCmdClientNum != (int)webSocket.connectedClients()) {
+        webSocket.sendTXT(wifiCmdClientNum, "{\"output\":\"msg: Scanning LAN (2s)...\\n\"}");
+      } else {
+        output += "msg: Scanning LAN (2s)...\n";
+      }
+      msgDevices.clear();
+      // 广播 3 次提高到达率
+      for (int b = 0; b < 3; b++) {
+        udp.beginPacket(IPAddress(255, 255, 255, 255), MSG_PORT);
+        udp.print("QINUX_HELLO:" + getDeviceName());
+        udp.endPacket();
+        delay(50);
+      }
+      unsigned long t0 = millis();
+      while (millis() - t0 < 2000) {
+        int sz = udp.parsePacket();
+        if (sz > 0) {
+          char buf[256] = {0}; int len = udp.read(buf, sizeof(buf) - 1);
+          if (len > 0) { buf[len] = 0; String data = String(buf);
+            if (data.startsWith("QINUX_REPLY:")) {
+              String peer = data.substring(12); bool found = false;
+              for (auto& d : msgDevices) { if (d.ip == udp.remoteIP()) { d.name = peer; d.lastSeen = millis(); found = true; break; } }
+              if (!found) msgDevices.push_back({peer, udp.remoteIP(), millis()});
+            }
+          }
+        }
+        yield();
+      }
+      if (msgDevices.empty()) { output += "msg: No devices found.\n"; return; }
+      output += "#  NAME                  IP\n-- --------------------- ---------------\n";
+      for (size_t i = 0; i < msgDevices.size(); i++) {
+        char line[80];
+        snprintf(line, sizeof(line), "%-2d %-20s  %s\n", (int)(i + 1), msgDevices[i].name.c_str(), msgDevices[i].ip.toString().c_str());
+        output += line;
+      }
+      output += "msg: " + String(msgDevices.size()) + " device(s). Use 'msg send <#> <text>' to message.\n";
+      return;
+    }
+    if (args == "name" || args.startsWith("name ")) {
+      String n = (args == "name") ? "" : args.substring(5); n.trim();
+      if (n.isEmpty()) { output = "msg: Name: " + getDeviceName() + "\nmsg: Usage: msg name <new>\n"; return; }
+      File f = LittleFS.open("/sys/hostname", "w");
+      if (!f) { output = "msg: Failed to save\n"; return; }
+      f.print(n + "\n"); f.close();
+      output = "msg: Name = '" + n + "'\n"; return;
+    }
+    if (args.startsWith("send ")) {
+      String rest = args.substring(5); rest.trim();
+      int sp = rest.indexOf(' ');
+      if (sp == -1) { output = "msg: Usage: msg send <#> <text>\n"; return; }
+      int idx = rest.substring(0, sp).toInt() - 1;
+      String text = rest.substring(sp + 1); text.trim();
+      if (idx < 0 || idx >= (int)msgDevices.size()) { output = "msg: Bad index. Use 'msg list'.\n"; return; }
+      if (text.isEmpty()) { output = "msg: Empty message\n"; return; }
+      udp.beginPacket(msgDevices[idx].ip, MSG_PORT);
+      udp.print("QINUX_MSG:" + getDeviceName() + ":" + text);
+      udp.endPacket();
+      output = "msg: Sent to " + msgDevices[idx].name + "\n"; return;
+    }
+    output += "msg — LAN messaging\n  msg list / scan / name <x> / send <#> <text>\n"; return;
+  }
+
+  // ========== 打开网页 ==========
+  if (cmd == "www" || cmd.startsWith("www ")) {
+    String path = (cmd == "www") ? "" : cmd.substring(4); path.trim();
+    if (path.isEmpty()) { output = "www: Usage: www <file>\n"; return; }
+    String fullPath = resolvePath(path);
+    if (!LittleFS.exists(fullPath)) {
+      output = "www: File not found: " + path + " (resolved: " + fullPath + ")\n";
+      return;
+    }
+    File check = LittleFS.open(fullPath, "r");
+    if (check && check.isDirectory()) { check.close(); output = "www: '" + path + "' is a directory\n"; return; }
+    if (check) check.close();
+    String url = "http://" + WiFi.softAPIP().toString() + "/www" + fullPath;
+    output = "__WWW__:" + url;
+    return;
+  }
 
   // ========== GPIO ==========
   if (cmd == "gpio" || cmd.startsWith("gpio ")) {

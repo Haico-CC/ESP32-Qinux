@@ -7,6 +7,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <WebSocketsServer.h>
+#include <WiFiUdp.h>
 #include <LittleFS.h>
 #include <FS.h>
 #include <time.h>
@@ -31,6 +32,9 @@ const char*     WIFI_CFG_PATH  = "/sys/wifi.cfg";
 const char*     LLM_MODEL_PATH = "/bin/stories260K.bin";
 const char*     LLM_TOKEN_PATH = "/bin/tok512.bin";
 
+// ========== 局域网消息类型（必须在 commands.h 之前）==========
+struct MsgDevice { String name; IPAddress ip; unsigned long lastSeen; };
+
 #include "utils.h"
 #include "hardware.h"
 #include "wifi_all.h"
@@ -52,6 +56,8 @@ void llm_bridge_free();
 DNSServer dnsServer;
 WebServer webServer(80);
 WebSocketsServer webSocket(81);
+WiFiUDP udp;
+const uint16_t MSG_PORT = 9527;
 
 // ========== 全局状态 ==========
 String currentPath = "/";
@@ -85,6 +91,57 @@ int scriptInputIndex = 0;
 bool scriptWaitingInput = false;
 String scriptInputVarName = "";
 
+// ========== 局域网消息状态 ==========
+std::vector<MsgDevice> msgDevices;
+
+// ========== 局域网消息辅助 ==========
+String getDeviceName() {
+  String name;
+  if (LittleFS.exists("/sys/hostname")) {
+    File f = LittleFS.open("/sys/hostname", "r");
+    if (f) { name = f.readStringUntil('\n'); f.close(); name.trim(); }
+  }
+  if (name.isEmpty()) { name = "ESP32-"; name += WiFi.macAddress().substring(9).substring(6); }
+  return name;
+}
+
+void handleMsgLoop() {
+  if (!staConnected && WiFi.status() != WL_CONNECTED) return;
+  static unsigned long lastBroadcast = 0;
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    char buf[256] = {0};
+    int len = udp.read(buf, sizeof(buf) - 1);
+    if (len > 0) {
+      buf[len] = 0; String data = String(buf);
+      if (data.startsWith("QINUX_HELLO:")) {
+        udp.beginPacket(udp.remoteIP(), udp.remotePort());
+        udp.print("QINUX_REPLY:" + getDeviceName());
+        udp.endPacket();
+      } else if (data.startsWith("QINUX_REPLY:")) {
+        String peer = data.substring(12); bool found = false;
+        for (auto& d : msgDevices) { if (d.ip == udp.remoteIP()) { d.name = peer; d.lastSeen = millis(); found = true; break; } }
+        if (!found) msgDevices.push_back({peer, udp.remoteIP(), millis()});
+      } else if (data.startsWith("QINUX_MSG:")) {
+        String body = data.substring(10); int sep = body.indexOf(':');
+        if (sep != -1) {
+          String from = body.substring(0, sep), text = body.substring(sep + 1);
+          String line = "[MSG] " + from + " (" + udp.remoteIP().toString() + "): " + text + "\n";
+          Serial.print(line);
+          webSocket.broadcastTXT("{\"output\":\"" + escapeJson(line) + "\"}");
+        }
+      }
+      yield();
+    }
+  }
+  if (millis() - lastBroadcast > 30000) {
+    lastBroadcast = millis();
+    udp.beginPacket(IPAddress(255, 255, 255, 255), MSG_PORT);
+    udp.print("QINUX_HELLO:" + getDeviceName());
+    udp.endPacket();
+  }
+}
+
 // ========== 初始化 ==========
 void setup() {
   Serial.begin(SERIAL_BAUD);
@@ -105,6 +162,7 @@ void setup() {
   Serial.println(AP_SSID);
   dnsServer.start(DNS_PORT, "*", AP_IP);
   webServer.on("/", handleRoot);
+  webServer.on("/www", handleWww);
   webServer.onNotFound(handleNotFound);
   webServer.begin();
   webSocket.begin();
@@ -119,6 +177,7 @@ void setup() {
   } else {
     Serial.println("WiFi STA: No saved config, use 'wifi connect' to set up");
   }
+  udp.begin(MSG_PORT);
   Serial.println("Qinux System Ready.");
   Serial.print("root@esp32:/# ");
   setWiFiTxPower(2);
@@ -131,4 +190,5 @@ void loop() {
   webSocket.loop();
   processSerialInput();
   checkChunkTimeout();
+  handleMsgLoop();
 }
